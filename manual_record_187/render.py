@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 
 from reportlab.pdfgen import canvas
+from reportlab.lib.colors import black, white
 
 from .measure import (
     BODY_LEADING,
@@ -34,7 +35,47 @@ def _fn_dest(number: int) -> str:
     return f"fn-{number}"
 
 
-def render_pdf(pages: list[Page], fn_texts: dict[int, str]) -> bytes:
+def _fmt_bound(value) -> str:
+    return format(value, "f")
+
+
+VERDICT_LABELS = {"pass": "PASS", "fail": "FAIL", "unmeasured": "NOT MEASURED"}
+
+
+def _draw_measurement(canv, item, baseline: float, readings) -> None:
+    """Draw a measurement line: label plus either an AcroForm text field
+    (template mode) or the recorded reading and verdict (record mode)."""
+    label = (
+        f"{item.name} [{item.unit}] "
+        f"({_fmt_bound(item.lower)}..{_fmt_bound(item.upper)}):"
+    )
+    canv.setFont(FONT_NAME, BODY_SIZE)
+    canv.drawString(MARGIN, baseline, label)
+    x = MARGIN + text_width(label, BODY_SIZE) + 6
+    if readings is None:
+        width = max(60.0, MARGIN + BODY_WIDTH - x)
+        canv.acroForm.textfield(
+            name=item.field_id,
+            tooltip=item.name,
+            x=x,
+            y=baseline - 2.5,
+            width=width,
+            height=13,
+            fontName="Helvetica",
+            fontSize=10,
+            borderWidth=0.5,
+            borderColor=black,
+            fillColor=white,
+            textColor=black,
+            forceBorder=True,
+        )
+    else:
+        raw, verdict = readings[item.field_id]
+        shown = raw if raw else "-"
+        canv.drawString(x, baseline, f"{shown}  ->  {VERDICT_LABELS[verdict]}")
+
+
+def render_pdf(pages: list[Page], fn_texts: dict[int, str], readings=None) -> bytes:
     buffer = io.BytesIO()
     canv = canvas.Canvas(buffer, pagesize=(PAGE_W, PAGE_H))
     canv.setTitle("Maintenance Manual")
@@ -46,6 +87,9 @@ def render_pdf(pages: list[Page], fn_texts: dict[int, str]) -> bytes:
         # --- body lines ---
         for i, pl in enumerate(page.lines):
             baseline = TOP_Y - BODY_LEADING * (i + 1) + (BODY_LEADING - BODY_SIZE) / 2
+            if pl.line.measurement is not None:
+                _draw_measurement(canv, pl.line.measurement, baseline, readings)
+                continue
             x = MARGIN
             for ci, chunk in enumerate(pl.line.chunks):
                 if ci:

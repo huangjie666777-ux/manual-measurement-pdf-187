@@ -52,6 +52,7 @@ class Line:
     chunks: list[list[Run]] = field(default_factory=list)
     width: float = 0.0
     new_refs: list[int] = field(default_factory=list)  # footnote numbers first seen here
+    measurement: object = None  # set on the placeholder line of a measured paragraph
 
 
 def _space_width() -> float:
@@ -63,18 +64,29 @@ def build_chunks(parts) -> list[list[Run]]:
 
     A chunk is a word plus any footnote references glued directly to it, so a
     superscript reference is never separated from its word by a line break.
+    Adjacent parts that are not separated by whitespace are glued into the
+    same chunk so no spurious space is inserted between them.
     """
     chunks: list[list[Run]] = []
+    glue = False  # next word joins the previous chunk without a space
     for part in parts:
         if part.text is not None:
-            for word in part.text.split():
-                chunks.append([Run("text", word)])
+            if part.text[0].isspace():
+                glue = False
+            words = part.text.split()
+            for i, word in enumerate(words):
+                if i == 0 and glue and chunks:
+                    chunks[-1].append(Run("text", word))
+                else:
+                    chunks.append([Run("text", word)])
+            glue = bool(words) and not part.text[-1].isspace()
         else:
             ref_run = Run("ref", part.footnote)  # id resolved to number later
             if chunks:
                 chunks[-1].append(ref_run)
             else:
                 chunks.append([ref_run])
+            glue = True
     return chunks
 
 

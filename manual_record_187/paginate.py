@@ -93,20 +93,21 @@ def _block_height(footnotes: list[int], fn_texts: dict[int, str]) -> float:
     return total
 
 
-def _fits(lines: list[PageLine], fn_texts: dict[int, str]) -> bool:
-    height = len(lines) * BODY_LEADING
+def _fits(lines: list[PageLine], fn_texts: dict[int, str], extra: float = 0.0) -> bool:
+    height = len(lines) * BODY_LEADING + extra
     height += _block_height(_page_footnotes(lines), fn_texts)
     return height <= BODY_HEIGHT + 1e-6
 
 
-def paginate(request) -> list[Page]:
+def paginate(request, measurements: dict | None = None) -> list[Page]:
     numbers = assign_numbers(request)
     fn_texts = {numbers[fid]: text for fid, text in request.footnotes.items() if fid in numbers}
+    measurements = measurements or {}
 
     # Wrap every paragraph into lines and record first-reference numbers.
     seen_refs: set[int] = set()
     paragraphs: list[list[Line]] = []
-    for parts in _numbered_parts(request, numbers):
+    for para_index, parts in enumerate(_numbered_parts(request, numbers)):
         chunks = build_chunks(parts)
         lines = wrap_chunks(chunks, BODY_WIDTH)
         for line in lines:
@@ -115,6 +116,11 @@ def paginate(request) -> list[Page]:
                     if run.kind == "ref" and run.value not in seen_refs:
                         seen_refs.add(run.value)
                         line.new_refs.append(run.value)
+        item = measurements.get(para_index)
+        if item is not None:
+            marker = Line()
+            marker.measurement = item
+            lines.append(marker)
         paragraphs.append(lines)
 
     pages: list[Page] = []
@@ -130,7 +136,16 @@ def paginate(request) -> list[Page]:
         total = len(lines)
         for li, line in enumerate(lines):
             candidate = current + [PageLine(para_index, line)]
-            if _fits(candidate, fn_texts):
+            has_marker = bool(lines) and lines[-1].measurement is not None
+            real_total = total - 1 if has_marker else total
+            # Reserve room for the measurement placeholder while placing the
+            # last two real lines of a measured paragraph, so the placeholder
+            # always ends up on the same page as them (or as the whole
+            # paragraph when it is a single line).
+            reserve = 0.0
+            if real_total < total and li < real_total and li >= real_total - 2:
+                reserve = BODY_LEADING
+            if _fits(candidate, fn_texts, extra=reserve):
                 current.append(PageLine(para_index, line))
                 continue
 
@@ -144,7 +159,12 @@ def paginate(request) -> list[Page]:
                         on_page += 1
                     else:
                         break
-                need_next = 1 if li == total - 1 else 0  # last line must not be orphaned
+                if line.measurement is not None:
+                    need_next = min(2, real_total)  # keep last lines with the box
+                elif li == real_total - 1:
+                    need_next = 1  # last line must not be orphaned
+                else:
+                    need_next = 0
                 move = max(move, need_next)
                 if on_page - move == 1:
                     move += 1  # do not leave a single line behind either

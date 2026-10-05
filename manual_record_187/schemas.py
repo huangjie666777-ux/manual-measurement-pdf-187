@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import re
+from decimal import Decimal
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 MAX_TOTAL_CHARS = 20000
 MAX_PARAGRAPHS = 100
+MAX_MEASUREMENTS = 12
+FIELD_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
 
 
 def _check_ascii_printable(value: str, what: str) -> str:
@@ -120,3 +124,96 @@ class ManualRequest(BaseModel):
                 if part.footnote is not None and part.footnote not in seen:
                     seen.append(part.footnote)
         return seen
+
+
+class MeasurementItem(BaseModel):
+    """One measurement bound to a paragraph of the manual."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field_id: str
+    paragraph: int  # 0-based paragraph index
+    name: str
+    unit: str
+    lower: Decimal
+    upper: Decimal
+    required: bool = True
+
+    @field_validator("field_id")
+    @classmethod
+    def field_id_valid(cls, v: str) -> str:
+        if not FIELD_ID_RE.match(v):
+            raise ValueError(
+                "field_id must start with a letter and contain only "
+                "ASCII letters, digits and underscores (max 32 chars)"
+            )
+        return v
+
+    @field_validator("paragraph")
+    @classmethod
+    def paragraph_valid(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("paragraph index must not be negative")
+        return v
+
+    @field_validator("name")
+    @classmethod
+    def name_valid(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("measurement name must not be empty")
+        if len(v) > 40:
+            raise ValueError("measurement name too long (max 40 chars)")
+        return _check_ascii_printable(v, "measurement name")
+
+    @field_validator("unit")
+    @classmethod
+    def unit_valid(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("measurement unit must not be empty")
+        if len(v) > 12:
+            raise ValueError("measurement unit too long (max 12 chars)")
+        return _check_ascii_printable(v, "measurement unit")
+
+    @field_validator("lower", "upper")
+    @classmethod
+    def bound_finite(cls, v: Decimal) -> Decimal:
+        if not v.is_finite():
+            raise ValueError("bounds must be finite decimal numbers")
+        return v
+
+    @model_validator(mode="after")
+    def range_not_inverted(self) -> "MeasurementItem":
+        if self.lower > self.upper:
+            raise ValueError("lower bound must not exceed upper bound")
+        return self
+
+
+class TemplateRequest(ManualRequest):
+    """Manual content plus the measurement items of a fill-in template."""
+
+    measurements: list[MeasurementItem]
+
+    @field_validator("measurements")
+    @classmethod
+    def measurements_valid(cls, v: list[MeasurementItem]) -> list[MeasurementItem]:
+        if not v:
+            raise ValueError("at least one measurement item is required")
+        if len(v) > MAX_MEASUREMENTS:
+            raise ValueError(f"too many measurement items (max {MAX_MEASUREMENTS})")
+        ids = [item.field_id for item in v]
+        if len(set(ids)) != len(ids):
+            raise ValueError("duplicate measurement field_id")
+        paragraphs = [item.paragraph for item in v]
+        if len(set(paragraphs)) != len(paragraphs):
+            raise ValueError("at most one measurement item per paragraph")
+        return v
+
+    @model_validator(mode="after")
+    def paragraphs_exist(self) -> "TemplateRequest":
+        for item in self.measurements:
+            if item.paragraph >= len(self.paragraphs):
+                raise ValueError(
+                    f"measurement {item.field_id!r}: paragraph index "
+                    f"{item.paragraph} out of range"
+                )
+        return self
