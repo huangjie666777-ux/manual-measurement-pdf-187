@@ -34,6 +34,7 @@ BODY_WIDTH = PAGE_W - 2 * MARGIN
 BODY_HEIGHT = PAGE_H - 2 * MARGIN
 TOP_Y = PAGE_H - MARGIN
 BOTTOM_Y = MARGIN
+FORM_HEIGHT = BODY_LEADING * 2
 
 # Separator between body and footnote block: gap + rule + gap.
 FOOT_SEP = 14.0
@@ -52,8 +53,21 @@ class PageLine:
 @dataclass
 class Page:
     number: int
-    lines: list[PageLine] = field(default_factory=list)
+    items: list[object] = field(default_factory=list)
     footnotes: list[int] = field(default_factory=list)  # footnote numbers, ascending
+
+    @property
+    def lines(self) -> list[PageLine]:
+        return [item for item in self.items if isinstance(item, PageLine)]
+
+    @property
+    def forms(self) -> list["FormBlock"]:
+        return [item for item in self.items if isinstance(item, FormBlock)]
+
+
+@dataclass
+class FormBlock:
+    measurement_index: int
 
 
 def assign_numbers(request) -> dict[str, int]:
@@ -84,6 +98,14 @@ def _page_footnotes(lines: list[PageLine]) -> list[int]:
     return sorted(seen)
 
 
+def _item_height(item: object) -> float:
+    return FORM_HEIGHT if isinstance(item, FormBlock) else BODY_LEADING
+
+
+def _items_lines(items: list[object]) -> list[PageLine]:
+    return [item for item in items if isinstance(item, PageLine)]
+
+
 def _block_height(footnotes: list[int], fn_texts: dict[int, str]) -> float:
     if not footnotes:
         return 0.0
@@ -93,15 +115,30 @@ def _block_height(footnotes: list[int], fn_texts: dict[int, str]) -> float:
     return total
 
 
-def _fits(lines: list[PageLine], fn_texts: dict[int, str]) -> bool:
-    height = len(lines) * BODY_LEADING
+def _fits(items: list[object], fn_texts: dict[int, str]) -> bool:
+    lines = _items_lines(items)
+    height = sum(_item_height(item) for item in items)
     height += _block_height(_page_footnotes(lines), fn_texts)
     return height <= BODY_HEIGHT + 1e-6
 
 
-def paginate(request) -> list[Page]:
+def _fits_with_reservation(items: list[object], fn_texts: dict[int, str], reservation: float) -> bool:
+    if reservation == 0:
+        return _fits(items, fn_texts)
+    lines = _items_lines(items)
+    height = sum(_item_height(item) for item in items) + reservation
+    height += _block_height(_page_footnotes(lines), fn_texts)
+    return height <= BODY_HEIGHT + 1e-6
+
+
+def paginate(request, measurements=None) -> list[Page]:
     numbers = assign_numbers(request)
     fn_texts = {numbers[fid]: text for fid, text in request.footnotes.items() if fid in numbers}
+    measurements = list(measurements or [])
+    forms_by_paragraph = {
+        item.paragraph - 1: FormBlock(measurement_index=index)
+        for index, item in enumerate(measurements)
+    }
 
     # Wrap every paragraph into lines and record first-reference numbers.
     seen_refs: set[int] = set()
@@ -110,7 +147,9 @@ def paginate(request) -> list[Page]:
         chunks = build_chunks(parts)
         lines = wrap_chunks(chunks, BODY_WIDTH)
         for line in lines:
-            for chunk in line.chunks:
+            for chunk in line.items:
+                if not isinstance(chunk, list):
+                    continue
                 for run in chunk:
                     if run.kind == "ref" and run.value not in seen_refs:
                         seen_refs.add(run.value)
@@ -118,20 +157,31 @@ def paginate(request) -> list[Page]:
         paragraphs.append(lines)
 
     pages: list[Page] = []
-    current: list[PageLine] = []
+    current: list[object] = []
 
     def flush() -> None:
         if current:
-            pages.append(Page(number=len(pages) + 1, lines=list(current),
-                              footnotes=_page_footnotes(current)))
+            current_lines = _items_lines(current)
+            pages.append(Page(number=len(pages) + 1, items=list(current),
+                              footnotes=_page_footnotes(current_lines)))
             current.clear()
 
     for para_index, lines in enumerate(paragraphs):
         total = len(lines)
         for li, line in enumerate(lines):
-            candidate = current + [PageLine(para_index, line)]
-            if _fits(candidate, fn_texts):
-                current.append(PageLine(para_index, line))
+            page_line = PageLine(para_index, line)
+            trailing = [forms_by_paragraph[para_index]] if (
+                para_index in forms_by_paragraph and li == total - 1
+            ) else []
+            candidate = current + [page_line] + trailing
+            reservation = (
+                (total - 1 - li) * BODY_LEADING + FORM_HEIGHT
+                if para_index in forms_by_paragraph and li >= total - 2
+                else 0.0
+            )
+            if _fits_with_reservation(candidate, fn_texts, reservation):
+                current.append(page_line)
+                current.extend(trailing)
                 continue
 
             # The line does not fit: break the page before it and pull back
@@ -139,22 +189,42 @@ def paginate(request) -> list[Page]:
             move = 0
             if total > 1:
                 on_page = 0
-                for pl in reversed(current):
+                for pl in reversed(_items_lines(current)):
                     if pl.para_index == para_index:
                         on_page += 1
                     else:
                         break
-                need_next = 1 if li == total - 1 else 0  # last line must not be orphaned
+                need_next = 2 if trailing and total >= 2 else 1
                 move = max(move, need_next)
-                if on_page - move == 1:
+                if trailing and move > on_page:
+                    raise LayoutError(
+                        "cannot keep a measurement with the last two paragraph lines on one page"
+                    )
+                if not trailing and on_page - move == 1:
                     move += 1  # do not leave a single line behind either
                 move = min(move, on_page)
+            elif total == 1 and not trailing:
+                move = 0
 
-            moved = current[len(current) - move:] if move else []
-            del current[len(current) - move:]
+            if move:
+                kept_line_count = max(0, len(_items_lines(current)) - move)
+                if kept_line_count == 0:
+                    split_at = 0
+                else:
+                    kept_ids = {id(item) for item in _items_lines(current)[:kept_line_count]}
+                    split_at = 0
+                    for index, item in enumerate(current):
+                        if isinstance(item, PageLine) and id(item) not in kept_ids:
+                            split_at = index
+                            break
+                moved = list(current[split_at:])
+                del current[split_at:]
+            else:
+                moved = []
             flush()
             current.extend(moved)
-            current.append(PageLine(para_index, line))
+            current.append(page_line)
+            current.extend(trailing)
             if not _fits(current, fn_texts):
                 raise LayoutError(
                     "cannot place a line together with the footnotes it "

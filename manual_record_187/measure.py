@@ -6,6 +6,7 @@ wrapping matches what is later drawn on the page.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from reportlab.pdfbase import pdfmetrics
@@ -48,14 +49,10 @@ class Run:
 
 @dataclass
 class Line:
-    # chunks: list of run-lists; chunks are separated by one space when drawn.
-    chunks: list[list[Run]] = field(default_factory=list)
+    # Items are run-lists (visible text/refs) or explicit whitespace tokens.
+    items: list[object] = field(default_factory=list)
     width: float = 0.0
     new_refs: list[int] = field(default_factory=list)  # footnote numbers first seen here
-
-
-def _space_width() -> float:
-    return text_width(" ", BODY_SIZE)
 
 
 def build_chunks(parts) -> list[list[Run]]:
@@ -65,12 +62,26 @@ def build_chunks(parts) -> list[list[Run]]:
     superscript reference is never separated from its word by a line break.
     """
     chunks: list[list[Run]] = []
+
+    def append_text(piece: str) -> None:
+        nonlocal chunks
+        if not chunks or isinstance(chunks[-1], LineSpace) or chunks[-1][-1].kind == "ref":
+            chunks.append([Run("text", piece)])
+        else:
+            chunks[-1][0] = Run("text", chunks[-1][0].value + piece)
+
     for part in parts:
         if part.text is not None:
-            for word in part.text.split():
-                chunks.append([Run("text", word)])
+            tokens = re.findall(r"\S+|\s+", part.text)
+            for token in tokens:
+                if token.isspace():
+                    chunks.append(LineSpace(token))
+                else:
+                    append_text(token)
         else:
             ref_run = Run("ref", part.footnote)  # id resolved to number later
+            if chunks and isinstance(chunks[-1], LineSpace):
+                chunks.pop()
             if chunks:
                 chunks[-1].append(ref_run)
             else:
@@ -78,47 +89,75 @@ def build_chunks(parts) -> list[list[Run]]:
     return chunks
 
 
+@dataclass
+class LineSpace:
+    value: str
+
+    @property
+    def width(self) -> float:
+        return text_width(self.value, BODY_SIZE)
+
+
 def _chunk_width(chunk: list[Run]) -> float:
     return sum(run.width for run in chunk)
 
 
-def _split_word_chunk(chunk: list[Run], max_width: float) -> list[list[Run]]:
-    """Split an over-wide word chunk by characters; refs stay on the last piece."""
-    word_run = chunk[0]
-    refs = chunk[1:]
-    pieces: list[list[Run]] = []
+def _is_space_item(item) -> bool:
+    return isinstance(item, LineSpace)
+
+
+def _item_width(item) -> float:
+    return sum(run.width for run in item) if isinstance(item, list) else item.width
+
+
+def _split_text_run(run: Run, max_width: float) -> list[Run]:
+    pieces: list[Run] = []
     current = ""
-    for ch in word_run.value:
+    for ch in run.value:
         if current and text_width(current + ch, BODY_SIZE) > max_width:
-            pieces.append([Run("text", current)])
+            pieces.append(Run("text", current))
             current = ch
         else:
             current += ch
-    pieces.append([Run("text", current)] + refs)
+    pieces.append(Run("text", current))
     return pieces
 
 
 def wrap_chunks(chunks: list[list[Run]], max_width: float) -> list[Line]:
     """Greedy whole-word wrapping; over-wide words are split by character."""
-    space = _space_width()
     lines: list[Line] = []
     current = Line()
-    for chunk in chunks:
-        width = _chunk_width(chunk)
-        if width > max_width and chunk[0].kind == "text":
-            pieces = _split_word_chunk(chunk, max_width)
+    for item in chunks:
+        if _is_space_item(item):
+            pieces = [item]
         else:
-            pieces = [chunk]
+            width = _chunk_width(item)
+            if width > max_width and item[0].kind == "text":
+                first_runs = _split_text_run(item[0], max_width)
+                refs = item[1:]
+                pieces = [[first_runs[0]]]
+                pieces.extend([[run] for run in first_runs[1:-1]])
+                pieces.append([first_runs[-1]] + refs)
+            else:
+                pieces = [item]
         for piece in pieces:
-            piece_width = _chunk_width(piece)
-            extra = piece_width if not current.chunks else space + piece_width
-            if current.chunks and current.width + extra > max_width:
+            piece_width = _item_width(piece)
+            is_space = _is_space_item(piece)
+            if is_space and not current.items:
+                continue
+            extra = piece_width
+            if current.items and not _is_space_item(current.items[-1]):
+                # Existing adjacent text runs are intentionally glued with no
+                # synthetic space; whitespace tokens supply real separators.
+                pass
+            if current.items and current.width + extra > max_width:
                 lines.append(current)
                 current = Line()
-                extra = piece_width
-            current.chunks.append(piece)
-            current.width += extra
-    if current.chunks or not lines:
+                if is_space:
+                    continue
+            current.items.append(piece)
+            current.width += piece_width
+    if current.items or not lines:
         lines.append(current)
     return lines
 

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import math
+import re
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 MAX_TOTAL_CHARS = 20000
 MAX_PARAGRAPHS = 100
+MAX_MEASUREMENTS = 12
+FIELD_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 
 def _check_ascii_printable(value: str, what: str) -> str:
@@ -120,3 +124,78 @@ class ManualRequest(BaseModel):
                 if part.footnote is not None and part.footnote not in seen:
                     seen.append(part.footnote)
         return seen
+
+
+class MeasurementSpec(BaseModel):
+    """A fillable measurement attached to one paragraph."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field_id: str
+    paragraph: int
+    name: str
+    unit: str
+    lower_bound: float
+    upper_bound: float
+    required: bool = True
+
+    @field_validator("field_id")
+    @classmethod
+    def field_id_valid(cls, value: str) -> str:
+        if not FIELD_ID_RE.fullmatch(value):
+            raise ValueError("field_id must start with an ASCII letter and contain only letters, digits or underscore")
+        return value
+
+    @field_validator("paragraph")
+    @classmethod
+    def paragraph_valid(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("paragraph numbers are 1-based")
+        return value
+
+    @field_validator("name", "unit")
+    @classmethod
+    def text_value_valid(cls, value: str) -> str:
+        if value.strip() == "":
+            raise ValueError("measurement name and unit must not be blank")
+        return _check_ascii_printable(value, "measurement text")
+
+    @field_validator("lower_bound", "upper_bound")
+    @classmethod
+    def bound_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("measurement bounds must be finite")
+        return value
+
+    @model_validator(mode="after")
+    def range_valid(self) -> "MeasurementSpec":
+        if self.lower_bound > self.upper_bound:
+            raise ValueError("lower_bound must not be greater than upper_bound")
+        return self
+
+
+class TemplateRequest(ManualRequest):
+    measurements: list[MeasurementSpec]
+
+    @field_validator("measurements")
+    @classmethod
+    def measurements_valid(cls, value: list[MeasurementSpec]) -> list[MeasurementSpec]:
+        if not 1 <= len(value) <= MAX_MEASUREMENTS:
+            raise ValueError(f"measurements must contain between 1 and {MAX_MEASUREMENTS} items")
+        return value
+
+    @model_validator(mode="after")
+    def measurement_cross_checks(self) -> "TemplateRequest":
+        seen_ids: set[str] = set()
+        seen_paragraphs: set[int] = set()
+        for item in self.measurements:
+            field_id = item.field_id
+            if field_id in seen_ids:
+                raise ValueError(f"duplicate measurement field_id: {field_id!r}")
+            seen_ids.add(field_id)
+            if item.paragraph > len(self.paragraphs):
+                raise ValueError(f"measurement paragraph {item.paragraph} is outside the manuscript")
+            if item.paragraph in seen_paragraphs:
+                raise ValueError(f"paragraph {item.paragraph} has more than one measurement")
+            seen_paragraphs.add(item.paragraph)
+        return self
